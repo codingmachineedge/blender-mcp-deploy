@@ -1,0 +1,22 @@
+{
+  "servers": [
+    {
+      "name": "blender",
+      "description": "Blender MCP server for 3D scene manipulation via AI",
+      "type": "python",
+      "pip_package": "blender-mcp",
+      "version": "",
+      "command": "python",
+      "args": ["-m", "blender_mcp"],
+      "env": {},
+      "requires_blender": true,
+      "blender_addon_script": "install-addon.py",
+      "enabled": true
+    }
+  ],
+  "defaults": {
+    "install_dir": "",
+    "venv_path": "",
+    "portable": false
+  }
+}
