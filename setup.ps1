@@ -1,31 +1,62 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Fully automatic Blender MCP Server deployment for any Windows installation.
+    Fully automatic multi-MCP server deployment for any Windows installation.
 .DESCRIPTION
-    - Detects or installs Blender (winget, direct download, or manual)
-    - Detects or installs Python (winget, direct download, or manual)
-    - Creates a dedicated venv and installs blender-mcp
-    - Installs the Blender addon automatically
+    - Auto-elevates to admin if needed
+    - Reads servers.json for which MCP servers to deploy
+    - Detects or installs Blender (if any server requires it)
+    - Detects or installs Python (winget, direct download)
+    - Creates a dedicated venv and installs all Python-based servers
+    - Installs Blender addons automatically
     - Sets up WSL components (if WSL is available)
     - Writes MCP config for OpenCode, Claude Code, and Codex
-    - Works without admin rights where possible
     - No winget required - uses direct downloads as fallback
 #>
 
 [CmdletBinding()]
 param(
-    [string]$BlenderMcpVersion = "",
     [switch]$SkipWsl,
     [switch]$SkipBlenderInstall,
     [switch]$SkipPythonInstall,
     [switch]$Portable,
+    [switch]$NoAutoElevate,
     [string]$VenvPath = "",
-    [string]$InstallDir = ""
+    [string]$InstallDir = "",
+    [string]$ServerConfig = ""
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+
+# ── Admin elevation check ───────────────────────────────────────────
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin -and -not $NoAutoElevate -and -not $Portable) {
+    Write-Host "`n>> Requesting administrator privileges..." -ForegroundColor Yellow
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$scriptPath`"")
+    $argList += @("-NoAutoElevate")
+    if ($SkipWsl) { $argList += "-SkipWsl" }
+    if ($SkipBlenderInstall) { $argList += "-SkipBlenderInstall" }
+    if ($SkipPythonInstall) { $argList += "-SkipPythonInstall" }
+    if ($Portable) { $argList += "-Portable" }
+    if ($VenvPath) { $argList += @("-VenvPath", "`"$VenvPath`"") }
+    if ($InstallDir) { $argList += @("-InstallDir", "`"$InstallDir`"") }
+    if ($ServerConfig) { $argList += @("-ServerConfig", "`"$ServerConfig`"") }
+    
+    try {
+        Start-Process powershell.exe -Verb RunAs -ArgumentList $argList -Wait
+        exit 0
+    } catch {
+        Write-Host "   WARNING: Could not elevate to admin. Continuing without admin rights..." -ForegroundColor Yellow
+        Write-Host "   Some features may not work. Use -Portable flag for user-only install." -ForegroundColor Yellow
+    }
+}
+
+if ($isAdmin) {
+    Write-Host "`n>> Running with administrator privileges" -ForegroundColor Green
+}
 
 function Write-Step { param([string]$msg) Write-Host "`n>> $msg" -ForegroundColor Cyan }
 function Write-Ok   { param([string]$msg) Write-Host "   OK: $msg" -ForegroundColor Green }
@@ -36,11 +67,25 @@ function Write-Warn { param([string]$msg) Write-Host "   WARNING: $msg" -Foregro
 $repoRoot    = $PSScriptRoot
 $scriptsDir  = Join-Path $repoRoot "scripts"
 
+if (-not $ServerConfig) {
+    $ServerConfig = Join-Path $repoRoot "servers.json"
+}
+
+if (-not (Test-Path $ServerConfig)) {
+    throw "Server config not found at $ServerConfig. Run add-server.ps1 first or create servers.json manually."
+}
+
+$serverConfigData = Get-Content $ServerConfig -Raw | ConvertFrom-Json
+
+if ($serverConfigData.defaults.install_dir -and -not $InstallDir) {
+    $InstallDir = $serverConfigData.defaults.install_dir
+}
+
 if (-not $InstallDir) {
-    if ($Portable) {
+    if ($Portable -or $serverConfigData.defaults.portable) {
         $InstallDir = Join-Path $repoRoot "install"
     } else {
-        $InstallDir = Join-Path $env:LOCALAPPDATA "blender-mcp"
+        $InstallDir = Join-Path $env:LOCALAPPDATA "mcp-servers"
     }
 }
 
@@ -48,142 +93,151 @@ if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 }
 
+if ($serverConfigData.defaults.venv_path -and -not $VenvPath) {
+    $VenvPath = $serverConfigData.defaults.venv_path
+}
+
 if (-not $VenvPath) {
     $VenvPath = Join-Path $InstallDir "venv"
 }
 
-Write-Host "Blender MCP Deploy" -ForegroundColor Green
+Write-Host ""
+Write-Host "  MCP Server Deploy" -ForegroundColor Green
+Write-Host "  =================" -ForegroundColor Green
 Write-Host "  Install dir: $InstallDir" -ForegroundColor Gray
 Write-Host "  Venv path:   $VenvPath" -ForegroundColor Gray
+Write-Host "  Config:      $ServerConfig" -ForegroundColor Gray
 
-# ── 1. Detect or Install Blender ────────────────────────────────────
-Write-Step "Checking Blender"
+# ── Check if any server requires Blender ────────────────────────────
+$needsBlender = $false
+foreach ($server in $serverConfigData.servers) {
+    if ($server.enabled -and $server.requires_blender) {
+        $needsBlender = $true
+        break
+    }
+}
+
+# ── 1. Detect or Install Blender (if needed) ────────────────────────
 $blenderExe = $null
 
-# Check PATH first
-$blenderExe = (Get-Command blender -ErrorAction SilentlyContinue).Source
-
-# Check registry
-if (-not $blenderExe) {
-    $regPaths = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
-        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
-    )
-    foreach ($regPath in $regPaths) {
-        $blenderReg = Get-ItemProperty $regPath -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "*Blender*" } | Select-Object -First 1
-        if ($blenderReg -and $blenderReg.InstallLocation) {
-            $candidate = Join-Path $blenderReg.InstallLocation "blender.exe"
-            if (Test-Path $candidate) { $blenderExe = $candidate; break }
-        }
-    }
-}
-
-# Check common install locations
-if (-not $blenderExe) {
-    $searchPaths = @(
-        "${env:ProgramFiles}\Blender Foundation",
-        "${env:ProgramFiles(x86)}\Blender Foundation",
-        "$env:LOCALAPPDATA\Programs\Blender Foundation",
-        "$env:LOCALAPPDATA\Blender Foundation",
-        "C:\Blender",
-        "D:\Blender"
-    )
-    foreach ($p in $searchPaths) {
-        if (Test-Path $p) {
-            $found = Get-ChildItem -Path $p -Filter "blender.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found) { $blenderExe = $found.FullName; break }
-        }
-    }
-}
-
-if ($blenderExe) {
-    Write-Ok "Blender found at $blenderExe"
-} elseif ($SkipBlenderInstall) {
-    Write-Skip "Blender not found and -SkipBlenderInstall set"
-} else {
-    Write-Host "   Blender not found. Attempting installation..." -ForegroundColor Yellow
+if ($needsBlender) {
+    Write-Step "Checking Blender"
     
-    $installed = $false
+    $blenderExe = (Get-Command blender -ErrorAction SilentlyContinue).Source
     
-    # Try winget first
-    if (-not $installed) {
-        try {
-            $null = winget --version 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "   Trying winget..." -ForegroundColor Gray
-                winget install --id BlenderFoundation.Blender -e --accept-source-agreements --accept-package-agreements --silent
-                if ($LASTEXITCODE -eq 0) { $installed = $true }
+    if (-not $blenderExe) {
+        $regPaths = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        )
+        foreach ($regPath in $regPaths) {
+            $blenderReg = Get-ItemProperty $regPath -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "*Blender*" } | Select-Object -First 1
+            if ($blenderReg -and $blenderReg.InstallLocation) {
+                $candidate = Join-Path $blenderReg.InstallLocation "blender.exe"
+                if (Test-Path $candidate) { $blenderExe = $candidate; break }
             }
-        } catch { }
-    }
-    
-    # Direct download fallback
-    if (-not $installed) {
-        Write-Host "   Downloading Blender directly..." -ForegroundColor Gray
-        $blenderUrl = "https://download.blender.org/release/Blender4.2/blender-4.2.0-windows-x64.msi"
-        $blenderMsi = Join-Path $env:TEMP "blender-installer.msi"
-        
-        try {
-            Invoke-WebRequest -Uri $blenderUrl -OutFile $blenderMsi -UseBasicParsing
-            Write-Host "   Installing Blender (this may take a few minutes)..." -ForegroundColor Gray
-            
-            $installArgs = @("/i", $blenderMsi, "/qn", "/norestart")
-            if (-not $Portable) {
-                $installArgs += "ALLUSERS=1"
-            } else {
-                $installArgs += "TARGETDIR=`"$InstallDir\Blender`""
-            }
-            
-            $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $installArgs -Wait -PassThru -NoNewWindow
-            if ($process.ExitCode -eq 0) { $installed = $true }
-            
-            Remove-Item $blenderMsi -Force -ErrorAction SilentlyContinue
-        } catch {
-            Write-Warn "Direct download failed: $_"
         }
     }
     
-    # Re-scan for Blender
-    if ($installed) {
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
-        $blenderExe = (Get-Command blender -ErrorAction SilentlyContinue).Source
+    if (-not $blenderExe) {
+        $searchPaths = @(
+            "${env:ProgramFiles}\Blender Foundation",
+            "${env:ProgramFiles(x86)}\Blender Foundation",
+            "$env:LOCALAPPDATA\Programs\Blender Foundation",
+            "$env:LOCALAPPDATA\Blender Foundation",
+            "C:\Blender",
+            "D:\Blender"
+        )
+        foreach ($p in $searchPaths) {
+            if (Test-Path $p) {
+                $found = Get-ChildItem -Path $p -Filter "blender.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($found) { $blenderExe = $found.FullName; break }
+            }
+        }
+    }
+    
+    if ($blenderExe) {
+        Write-Ok "Blender found at $blenderExe"
+    } elseif ($SkipBlenderInstall) {
+        Write-Skip "Blender not found and -SkipBlenderInstall set"
+    } else {
+        Write-Host "   Blender not found. Attempting installation..." -ForegroundColor Yellow
         
-        if (-not $blenderExe) {
-            $searchPaths = @(
-                "${env:ProgramFiles}\Blender Foundation",
-                "$env:LOCALAPPDATA\Programs\Blender Foundation",
-                "$InstallDir\Blender"
-            )
-            foreach ($p in $searchPaths) {
-                if (Test-Path $p) {
-                    $found = Get-ChildItem -Path $p -Filter "blender.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-                    if ($found) { $blenderExe = $found.FullName; break }
+        $installed = $false
+        
+        if (-not $installed) {
+            try {
+                $null = winget --version 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "   Trying winget..." -ForegroundColor Gray
+                    winget install --id BlenderFoundation.Blender -e --accept-source-agreements --accept-package-agreements --silent
+                    if ($LASTEXITCODE -eq 0) { $installed = $true }
+                }
+            } catch { }
+        }
+        
+        if (-not $installed) {
+            Write-Host "   Downloading Blender directly..." -ForegroundColor Gray
+            $blenderUrl = "https://download.blender.org/release/Blender4.2/blender-4.2.0-windows-x64.msi"
+            $blenderMsi = Join-Path $env:TEMP "blender-installer.msi"
+            
+            try {
+                Invoke-WebRequest -Uri $blenderUrl -OutFile $blenderMsi -UseBasicParsing
+                Write-Host "   Installing Blender (this may take a few minutes)..." -ForegroundColor Gray
+                
+                $installArgs = @("/i", $blenderMsi, "/qn", "/norestart")
+                if (-not $Portable) {
+                    $installArgs += "ALLUSERS=1"
+                } else {
+                    $installArgs += "TARGETDIR=`"$InstallDir\Blender`""
+                }
+                
+                $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $installArgs -Wait -PassThru -NoNewWindow
+                if ($process.ExitCode -eq 0) { $installed = $true }
+                
+                Remove-Item $blenderMsi -Force -ErrorAction SilentlyContinue
+            } catch {
+                Write-Warn "Direct download failed: $_"
+            }
+        }
+        
+        if ($installed) {
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+            $blenderExe = (Get-Command blender -ErrorAction SilentlyContinue).Source
+            
+            if (-not $blenderExe) {
+                $searchPaths = @(
+                    "${env:ProgramFiles}\Blender Foundation",
+                    "$env:LOCALAPPDATA\Programs\Blender Foundation",
+                    "$InstallDir\Blender"
+                )
+                foreach ($p in $searchPaths) {
+                    if (Test-Path $p) {
+                        $found = Get-ChildItem -Path $p -Filter "blender.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                        if ($found) { $blenderExe = $found.FullName; break }
+                    }
                 }
             }
-        }
-        
-        if ($blenderExe) {
-            Write-Ok "Blender installed at $blenderExe"
+            
+            if ($blenderExe) {
+                Write-Ok "Blender installed at $blenderExe"
+            } else {
+                throw "Blender installation completed but executable not found. Please restart your terminal and re-run setup."
+            }
         } else {
-            throw "Blender installation completed but executable not found. Please restart your terminal and re-run setup."
+            throw "Could not install Blender automatically. Please install Blender manually from https://www.blender.org/download/ and re-run setup."
         }
-    } else {
-        throw "Could not install Blender automatically. Please install Blender manually from https://www.blender.org/download/ and re-run setup."
     }
 }
-
-$blenderVersionDir = Split-Path $blenderExe -Parent
 
 # ── 2. Detect or Install Python ─────────────────────────────────────
 Write-Step "Checking Python"
 $pythonExe = $null
 
-# Check PATH
 $pythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
 if (-not $pythonExe) { $pythonExe = (Get-Command python3 -ErrorAction SilentlyContinue).Source }
 
-# Check registry
 if (-not $pythonExe) {
     $regPaths = @(
         "HKLM:\SOFTWARE\Python\PythonCore\*\InstallPath",
@@ -198,7 +252,6 @@ if (-not $pythonExe) {
     }
 }
 
-# Check common locations
 if (-not $pythonExe) {
     $searchPaths = @(
         "$env:LOCALAPPDATA\Programs\Python",
@@ -224,7 +277,6 @@ if ($pythonExe) {
     
     $installed = $false
     
-    # Try winget first
     if (-not $installed) {
         try {
             $null = winget --version 2>&1
@@ -236,7 +288,6 @@ if ($pythonExe) {
         } catch { }
     }
     
-    # Direct download fallback
     if (-not $installed) {
         Write-Host "   Downloading Python directly..." -ForegroundColor Gray
         $pythonUrl = "https://www.python.org/ftp/python/3.12.4/python-3.12.4-amd64.exe"
@@ -260,7 +311,6 @@ if ($pythonExe) {
         }
     }
     
-    # Re-scan for Python
     if ($installed) {
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
         $pythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
@@ -287,8 +337,8 @@ if ($pythonExe) {
     }
 }
 
-# ── 3. Create venv & install blender-mcp ────────────────────────────
-Write-Step "Setting up Python venv + blender-mcp"
+# ── 3. Create venv ──────────────────────────────────────────────────
+Write-Step "Setting up Python venv"
 if (-not (Test-Path $VenvPath)) {
     & $pythonExe -m venv $VenvPath
     Write-Ok "Created venv at $VenvPath"
@@ -299,19 +349,36 @@ if (-not (Test-Path $VenvPath)) {
 $venvPython = Join-Path $VenvPath "Scripts\python.exe"
 $venvPip    = Join-Path $VenvPath "Scripts\pip.exe"
 
-$pkgSpec = if ($BlenderMcpVersion) { "blender-mcp==$BlenderMcpVersion" } else { "blender-mcp" }
 & $venvPython -m pip install --upgrade pip 2>&1 | Out-Null
-& $venvPip install $pkgSpec 2>&1 | Out-Null
-Write-Ok "blender-mcp installed"
 
-# ── 4. Install Blender addon ────────────────────────────────────────
-Write-Step "Installing Blender addon"
-$addonInstaller = Join-Path $scriptsDir "install-addon.py"
-if (Test-Path $addonInstaller) {
-    & $blenderExe --background --python "$addonInstaller" 2>&1 | Out-Null
-    Write-Ok "Blender MCP addon installed"
-} else {
-    Write-Skip "Addon installer script not found at $addonInstaller"
+# ── 4. Install each server ──────────────────────────────────────────
+$installedServers = @()
+
+foreach ($server in $serverConfigData.servers) {
+    if (-not $server.enabled) {
+        Write-Skip "Server '$($server.name)' is disabled"
+        continue
+    }
+    
+    Write-Step "Installing server: $($server.name)"
+    
+    if ($server.type -eq "python" -and $server.pip_package) {
+        $pkgSpec = if ($server.version) { "$($server.pip_package)==$($server.version)" } else { $server.pip_package }
+        Write-Host "   Installing $pkgSpec..." -ForegroundColor Gray
+        & $venvPip install $pkgSpec 2>&1 | Out-Null
+        Write-Ok "$($server.name) installed"
+        
+        if ($server.requires_blender -and $server.blender_addon_script -and $blenderExe) {
+            $addonScript = Join-Path $scriptsDir $server.blender_addon_script
+            if (Test-Path $addonScript) {
+                Write-Host "   Installing Blender addon..." -ForegroundColor Gray
+                & $blenderExe --background --python "$addonScript" 2>&1 | Out-Null
+                Write-Ok "Blender addon installed"
+            }
+        }
+    }
+    
+    $installedServers += $server
 }
 
 # ── 5. WSL setup ────────────────────────────────────────────────────
@@ -342,19 +409,54 @@ if (-not $SkipWsl) {
 # ── 6. Write agent configs ──────────────────────────────────────────
 Write-Step "Configuring AI agent MCP connections"
 
-$mcpServerCommand = $venvPython
-$mcpServerArgs = @("-m", "blender_mcp")
+$opencodeServers = @{}
+$claudeServers = @{}
+$codexServers = @{}
+$agentsMdSections = @()
+
+foreach ($server in $installedServers) {
+    $serverName = $server.name
+    
+    if ($server.type -eq "python") {
+        $cmd = $venvPython
+        $argsList = if ($server.args) { $server.args } else { @("-m", $server.pip_package -replace '-', '_') }
+    } else {
+        $cmd = $server.command
+        $argsList = $server.args
+    }
+    
+    $opencodeServers[$serverName] = @{
+        type    = "stdio"
+        command = $cmd
+        args    = $argsList
+    }
+    
+    $claudeServers[$serverName] = @{
+        command = $cmd
+        args    = $argsList
+    }
+    
+    $codexServers[$serverName] = @{
+        command = $cmd
+        args    = $argsList
+        env     = @{}
+    }
+    
+    $section = @"
+
+### $serverName
+- **Transport:** stdio
+- **Command:** ``$cmd``
+- **Args:** ``$($argsList -join ' ')``
+- **Description:** $($server.description)
+"@
+    $agentsMdSections += $section
+}
 
 # --- OpenCode (opencode.json) ---
 $opencodeConfig = @{
     mcp = @{
-        servers = @{
-            blender = @{
-                type    = "stdio"
-                command = $mcpServerCommand
-                args    = $mcpServerArgs
-            }
-        }
+        servers = $opencodeServers
     }
 } | ConvertTo-Json -Depth 10
 
@@ -364,12 +466,7 @@ Write-Ok "opencode.json written"
 
 # --- Claude Code (.mcp.json) ---
 $claudeConfig = @{
-    mcpServers = @{
-        blender = @{
-            command = $mcpServerCommand
-            args    = $mcpServerArgs
-        }
-    }
+    mcpServers = $claudeServers
 } | ConvertTo-Json -Depth 10
 
 $claudeJsonPath = Join-Path $repoRoot ".mcp.json"
@@ -381,15 +478,10 @@ $agentsMd = @"
 # AGENTS.md
 
 ## MCP Servers
-
-### blender
-- **Transport:** stdio
-- **Command:** ``$mcpServerCommand``
-- **Args:** ``$($mcpServerArgs -join ' ')``
-- **Description:** Blender MCP server for 3D scene manipulation via AI.
+$($agentsMdSections -join "`n")
 
 ## Instructions
-- Use the ``blender`` MCP server to create, modify, and query 3D scenes in Blender.
+- Use the MCP servers to interact with external tools and services.
 - Always confirm destructive operations with the user before executing.
 - Prefer non-destructive edits when possible.
 "@
@@ -413,12 +505,15 @@ if (Test-Path $opencodeGlobalJson) {
 if (-not $existing.PSObject.Properties['mcp']) {
     $existing | Add-Member -NotePropertyName "mcp" -NotePropertyValue ([PSCustomObject]@{ servers = [PSCustomObject]@{} })
 }
-$blenderServer = [PSCustomObject]@{
-    type    = "stdio"
-    command = $mcpServerCommand
-    args    = $mcpServerArgs
+foreach ($serverName in $opencodeServers.Keys) {
+    $srv = $opencodeServers[$serverName]
+    $serverObj = [PSCustomObject]@{
+        type    = $srv.type
+        command = $srv.command
+        args    = $srv.args
+    }
+    $existing.mcp.servers | Add-Member -NotePropertyName $serverName -NotePropertyValue $serverObj -Force
 }
-$existing.mcp.servers | Add-Member -NotePropertyName "blender" -NotePropertyValue $blenderServer -Force
 $existing | ConvertTo-Json -Depth 10 | Set-Content $opencodeGlobalJson -Encoding UTF8
 Write-Ok "OpenCode global config updated ($opencodeGlobalJson)"
 
@@ -434,11 +529,14 @@ if (Test-Path $claudeGlobalJson) {
 if (-not $existingClaude.PSObject.Properties['mcpServers']) {
     $existingClaude | Add-Member -NotePropertyName "mcpServers" -NotePropertyValue ([PSCustomObject]@{})
 }
-$blenderClaudeServer = [PSCustomObject]@{
-    command = $mcpServerCommand
-    args    = $mcpServerArgs
+foreach ($serverName in $claudeServers.Keys) {
+    $srv = $claudeServers[$serverName]
+    $serverObj = [PSCustomObject]@{
+        command = $srv.command
+        args    = $srv.args
+    }
+    $existingClaude.mcpServers | Add-Member -NotePropertyName $serverName -NotePropertyValue $serverObj -Force
 }
-$existingClaude.mcpServers | Add-Member -NotePropertyName "blender" -NotePropertyValue $blenderClaudeServer -Force
 $existingClaude | ConvertTo-Json -Depth 10 | Set-Content $claudeGlobalJson -Encoding UTF8
 Write-Ok "Claude global config updated ($claudeGlobalJson)"
 
@@ -454,26 +552,34 @@ if (Test-Path $codexGlobalJson) {
 if (-not $existingCodex.PSObject.Properties['mcpServers']) {
     $existingCodex | Add-Member -NotePropertyName "mcpServers" -NotePropertyValue ([PSCustomObject]@{})
 }
-$blenderCodexServer = [PSCustomObject]@{
-    command = $mcpServerCommand
-    args    = $mcpServerArgs
-    env     = [PSCustomObject]@{}
+foreach ($serverName in $codexServers.Keys) {
+    $srv = $codexServers[$serverName]
+    $serverObj = [PSCustomObject]@{
+        command = $srv.command
+        args    = $srv.args
+        env     = [PSCustomObject]@{}
+    }
+    $existingCodex.mcpServers | Add-Member -NotePropertyName $serverName -NotePropertyValue $serverObj -Force
 }
-$existingCodex.mcpServers | Add-Member -NotePropertyName "blender" -NotePropertyValue $blenderCodexServer -Force
 $existingCodex | ConvertTo-Json -Depth 10 | Set-Content $codexGlobalJson -Encoding UTF8
 Write-Ok "Codex global config updated ($codexGlobalJson)"
 
 # ── Done ─────────────────────────────────────────────────────────────
 Write-Host "`n" -NoNewline
 Write-Host "============================================" -ForegroundColor Green
-Write-Host "  Blender MCP Server deployed successfully!" -ForegroundColor Green
+Write-Host "  MCP Servers deployed successfully!" -ForegroundColor Green
 Write-Host "============================================" -ForegroundColor Green
 Write-Host ""
+Write-Host "Installed servers:" -ForegroundColor White
+foreach ($server in $installedServers) {
+    Write-Host "  - $($server.name): $($server.description)" -ForegroundColor Gray
+}
+Write-Host ""
 Write-Host "Next steps:" -ForegroundColor White
-Write-Host "  1. Open Blender - the MCP addon will start automatically"
-Write-Host "  2. Launch your AI agent (OpenCode / Claude / Codex)"
-Write-Host "  3. The blender MCP tools will be available automatically"
+Write-Host "  1. Launch your AI agent (OpenCode / Claude / Codex)"
+Write-Host "  2. The MCP tools will be available automatically"
 Write-Host ""
-Write-Host "To start the MCP server manually:" -ForegroundColor White
-Write-Host "  .\scripts\start-mcp-server.ps1" -ForegroundColor Gray
-Write-Host ""
+if ($needsBlender -and $blenderExe) {
+    Write-Host "  Note: Open Blender for Blender MCP servers to work" -ForegroundColor Yellow
+    Write-Host ""
+}

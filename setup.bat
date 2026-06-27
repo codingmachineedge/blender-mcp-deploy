@@ -2,8 +2,8 @@
 setlocal
 
 echo.
-echo  Blender MCP Deploy
-echo  ===================
+echo  MCP Server Deploy
+echo  ==================
 echo.
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup.ps1" %*

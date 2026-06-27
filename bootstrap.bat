@@ -2,8 +2,8 @@
 setlocal
 
 echo.
-echo  Blender MCP Deploy - Bootstrap
-echo  ===============================
+echo  MCP Server Deploy - Bootstrap
+echo  ==============================
 echo.
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-ExecutionPolicy Bypass -Scope Process -Force; Invoke-RestMethod 'https://raw.githubusercontent.com/codingmachineedge/blender-mcp-deploy/main/bootstrap.ps1' | Invoke-Expression" %*
